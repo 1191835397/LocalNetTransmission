@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "仅主窗口的基础 IPC 与原生选择对话框；不授予文件系统或 shell 访问。",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
