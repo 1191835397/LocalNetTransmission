@@ -1032,14 +1032,41 @@ h1 {
   overflow-wrap: anywhere;
 }
 .trusted-list,
+.discovered-list,
 .transfer-list {
   margin: 16px 0 0;
   padding: 0;
   list-style: none;
 }
-.trusted-list > li {
+.trusted-list > li,
+.discovered-list > li {
   padding: 14px 0;
   border-top: 1px solid #edf2e7;
+}
+.discovery-card {
+  min-width: 0;
+}
+.discovery-card .section-title {
+  flex-wrap: wrap;
+}
+.discovery-button {
+  width: 100%;
+  margin-top: 12px;
+}
+.discovered-list {
+  max-height: 360px;
+  overflow-y: auto;
+}
+.discovered-addresses {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+}
+.discovered-addresses .text-button {
+  text-align: left;
+  white-space: normal;
 }
 .recipient-option {
   display: flex;

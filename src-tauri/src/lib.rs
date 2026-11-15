@@ -1,3 +1,4 @@
+mod discovery;
 mod engine;
 mod files;
 mod identity;
@@ -53,9 +54,19 @@ struct Backend {
     identity: Arc<identity::Identity>,
     engine: Arc<engine::Engine>,
     service: Option<service::ServiceHandle>,
+    discovery: Option<discovery::DiscoveryHandle>,
 }
 
 impl Backend {
+    fn discovery_snapshot(&self) -> discovery::DiscoverySnapshot {
+        match &self.discovery {
+            Some(discovery) => discovery.snapshot(),
+            None => discovery::DiscoverySnapshot::unavailable(
+                "本机监听服务未启动，无法发现设备。请检查端口占用并重启应用。",
+            ),
+        }
+    }
+
     fn snapshot(&self) -> Result<AppSnapshot, String> {
         let service = self
             .service
@@ -110,12 +121,21 @@ async fn initialize(config_dir: &Result<PathBuf, String>) -> Result<Backend, Str
         settings.device_name.clone(),
     )?;
     let service = service::start(&identity, port, engine.clone()).await;
+    let listening = service.snapshot();
+    let discovery = (listening.state == service::ServiceState::Running).then(|| {
+        discovery::start(
+            settings.device_name.clone(),
+            identity.fingerprint.clone(),
+            listening.port,
+        )
+    });
     Ok(Backend {
         device,
         settings,
         identity,
         engine,
         service: Some(service),
+        discovery,
     })
 }
 
@@ -123,6 +143,31 @@ async fn initialize(config_dir: &Result<PathBuf, String>) -> Result<Backend, Str
 fn get_snapshot(state: State<'_, NativeState>) -> Result<AppSnapshot, String> {
     let backend = state.backend.lock().map_err(|_| "本机应用状态锁异常。")?;
     backend.as_ref().map_err(Clone::clone)?.snapshot()
+}
+
+#[tauri::command]
+fn get_discovery_snapshot(
+    state: State<'_, NativeState>,
+) -> Result<discovery::DiscoverySnapshot, String> {
+    let backend = state.backend.lock().map_err(|_| "本机应用状态锁异常。")?;
+    Ok(backend.as_ref().map_err(Clone::clone)?.discovery_snapshot())
+}
+
+#[tauri::command]
+async fn discover_devices(
+    state: State<'_, NativeState>,
+) -> Result<discovery::DiscoverySnapshot, String> {
+    transfer_engine(&state, true)?;
+    let backend = Arc::clone(&state.backend);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut backend = backend.lock().map_err(|_| "本机应用状态锁异常。")?;
+        let backend = backend.as_mut().map_err(|error| error.clone())?;
+        let discovery = backend.discovery.as_mut().ok_or("设备发现服务尚未启动。")?;
+        discovery.refresh()?;
+        Ok(discovery.snapshot())
+    })
+    .await
+    .map_err(|error| format!("重新发现设备失败：{error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -140,6 +185,9 @@ async fn save_settings(
         backend
             .engine
             .set_name(backend.settings.device_name.clone());
+        if let Some(discovery) = backend.discovery.as_mut() {
+            discovery.set_name(backend.settings.device_name.clone());
+        }
         // Port changes apply next launch; never pretend to rebind the current service.
         backend.snapshot()
     })
@@ -330,6 +378,19 @@ async fn run_diagnostics(state: State<'_, NativeState>) -> Result<Vec<Diagnostic
                         identity::storage_name()
                     ),
                 ));
+                let discovery = backend.discovery_snapshot();
+                results.push(diagnostic(
+                    "局域网设备发现",
+                    if discovery.error.is_some() {
+                        DiagnosticStatus::Fail
+                    } else {
+                        DiagnosticStatus::Info
+                    },
+                    discovery.error.unwrap_or_else(|| format!(
+                        "mDNS 自动发现正在运行，当前发现 {} 台邻传设备；使用 UDP 5353，仅发现同一组播域的设备，发现结果不代表身份已验证或传输可达。",
+                        discovery.devices.len()
+                    )),
+                ));
                 backend.service.as_ref().map(|service| {
                     (
                         backend.identity.clone(),
@@ -395,7 +456,7 @@ async fn run_diagnostics(state: State<'_, NativeState>) -> Result<Vec<Diagnostic
     results.push(diagnostic(
         "局域网开放状态",
         DiagnosticStatus::Info,
-        "P2 监听 IPv4，接受私有、链路本地和回环来源；仅手动连接，不扫描设备。文件接口要求固定身份和逐次接收批准。若不可达，请检查两端网络和应用防火墙许可；不要关闭防火墙。",
+        "监听 IPv4，接受私有、链路本地和回环来源；自动发现使用 mDNS，不逐个扫描网段。组播被禁用但单播可达时可手动连接，AP 隔离无法绕过。文件接口要求固定身份和逐次接收批准。请检查两端网络与应用防火墙许可，不要关闭防火墙。",
     ));
     Ok(results)
 }
@@ -417,6 +478,19 @@ fn navigation_allowed(url: &tauri::Url) -> bool {
 
 fn finish_exit(app: tauri::AppHandle, engine: Option<Arc<engine::Engine>>) {
     tauri::async_runtime::spawn(async move {
+        let discovery = {
+            let state = app.state::<NativeState>();
+            let discovery = state.backend.lock().ok().and_then(|mut backend| {
+                backend
+                    .as_mut()
+                    .ok()
+                    .and_then(|backend| backend.discovery.take())
+            });
+            discovery
+        };
+        if let Some(discovery) = discovery {
+            discovery.shutdown().await;
+        }
         if let Some(engine) = engine {
             engine.shutdown().await;
         }
@@ -485,6 +559,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_discovery_snapshot,
+            discover_devices,
             save_settings,
             inspect_files,
             run_diagnostics,
@@ -597,6 +673,7 @@ mod tests {
             identity,
             engine,
             service: Some(service),
+            discovery: None,
         };
         let mut changed = backend.settings.clone();
         changed.port = if actual_port == 53318 { 53319 } else { 53318 };
@@ -611,6 +688,10 @@ mod tests {
             changed
         );
         assert!(service::probe(&backend.identity, actual_port).await.is_ok());
+        let discovery = backend.discovery_snapshot();
+        assert!(discovery.error.is_some());
+        assert!(discovery.devices.is_empty());
+        assert!(backend.engine.snapshot().is_ok());
         backend.engine.shutdown().await;
         backend.service.take().unwrap().shutdown().await;
     }

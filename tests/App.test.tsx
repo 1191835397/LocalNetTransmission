@@ -5,7 +5,13 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import App from '../src/App';
 import * as bridge from '../src/bridge';
 import { validFingerprint, validPeerAddress, verificationLabel } from '../src/TransferUI';
-import type { AppSnapshot, PeerInfo, TransferInfo, TransferSnapshot } from '../src/types';
+import type {
+  AppSnapshot,
+  DiscoverySnapshot,
+  PeerInfo,
+  TransferInfo,
+  TransferSnapshot,
+} from '../src/types';
 
 vi.mock('../src/bridge', () => ({
   isDesktop: vi.fn(() => false),
@@ -16,6 +22,8 @@ vi.mock('../src/bridge', () => ({
   chooseDirectory: vi.fn(),
   runDiagnostics: vi.fn(),
   getTransferSnapshot: vi.fn(),
+  getDiscoverySnapshot: vi.fn(),
+  discoverDevices: vi.fn(),
   connectPeer: vi.fn(),
   respondPair: vi.fn(),
   forgetPeer: vi.fn(),
@@ -52,6 +60,19 @@ const peer: PeerInfo = {
   port: 53318,
 };
 const emptyTransfers: TransferSnapshot = { peers: [], pairRequests: [], tasks: [] };
+const emptyDiscovery: DiscoverySnapshot = {
+  state: 'running',
+  scanning: false,
+  devices: [],
+  error: null,
+};
+const discoveredDevice = {
+  fingerprint: peer.fingerprint,
+  name: '附近的电脑',
+  platform: 'windows',
+  addresses: [peer.address, '10.0.0.8'],
+  port: peer.port,
+};
 const nativeFile = { name: 'data.bin', path: 'C:\\data.bin', size: 1024, modifiedAt: null };
 function task(overrides: Partial<TransferInfo> = {}): TransferInfo {
   return {
@@ -86,6 +107,8 @@ beforeEach(() => {
   vi.mocked(bridge.isDesktop).mockReturnValue(false);
   vi.mocked(bridge.getSnapshot).mockResolvedValue(structuredClone(snapshot));
   vi.mocked(bridge.getTransferSnapshot).mockResolvedValue(structuredClone(emptyTransfers));
+  vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue(structuredClone(emptyDiscovery));
+  vi.mocked(bridge.discoverDevices).mockResolvedValue({ ...emptyDiscovery, scanning: true });
   vi.mocked(bridge.chooseFiles).mockResolvedValue([nativeFile]);
   vi.mocked(bridge.respondPair).mockResolvedValue(undefined);
   vi.mocked(bridge.respondTransfer).mockResolvedValue(undefined);
@@ -151,12 +174,13 @@ describe('browser preview', () => {
 
 describe('desktop IPC integration', () => {
   beforeEach(() => vi.mocked(bridge.isDesktop).mockReturnValue(true));
-  it('renders real snapshot fields and does not imply LAN discovery is running', async () => {
+  it('renders real snapshot fields and native discovery state', async () => {
     render(<App />);
     expect(await screen.findByText('测试电脑')).toBeInTheDocument();
     expect(screen.getByText('192.168.1.2')).toBeInTheDocument();
     expect(screen.getByText('本机 TLS 服务已启动')).toBeInTheDocument();
-    expect(screen.getByText('自动发现尚未启用')).toBeInTheDocument();
+    expect(await screen.findByText('自动发现已开启')).toBeInTheDocument();
+    expect(bridge.getDiscoverySnapshot).toHaveBeenCalled();
   });
   it('explains restart after initialization failure and still allows diagnostics', async () => {
     vi.mocked(bridge.getSnapshot).mockRejectedValueOnce('身份存储不可用');
@@ -639,6 +663,8 @@ describe('P2 snapshot lifecycle', () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
     expect(bridge.getTransferSnapshot).not.toHaveBeenCalled();
+    expect(bridge.getDiscoverySnapshot).not.toHaveBeenCalled();
+    expect(bridge.discoverDevices).not.toHaveBeenCalled();
     expect(screen.getByRole('alert')).toHaveTextContent('backend missing');
   });
 
@@ -690,6 +716,199 @@ describe('P2 snapshot lifecycle', () => {
     vi.mocked(bridge.getTransferSnapshot).mockRejectedValue('temporary outage');
     await advancePoll();
     expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+});
+
+describe('nearby device discovery', () => {
+  const connectionName = `连接 ${discoveredDevice.name} (${peer.address}:${peer.port})`;
+  function advertise() {
+    vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue({
+      ...emptyDiscovery,
+      devices: [discoveredDevice],
+    });
+  }
+
+  it('keeps discovery unavailable in browser preview', () => {
+    render(<App />);
+    expect(screen.getByRole('button', { name: '发现本地设备' })).toBeDisabled();
+    expect(screen.getByText('浏览器无法发现局域网设备')).toBeInTheDocument();
+    expect(bridge.getDiscoverySnapshot).not.toHaveBeenCalled();
+    expect(bridge.discoverDevices).not.toHaveBeenCalled();
+  });
+
+  it('fills the chosen interface without trusting it or bypassing fingerprint verification', async () => {
+    advertise();
+    const pairing = deferred<PeerInfo>();
+    vi.mocked(bridge.connectPeer).mockReturnValue(pairing.promise);
+    await renderNative(emptyTransfers);
+    await go(connectionName);
+    expect(screen.getByLabelText('对方 IPv4 地址')).toHaveValue(peer.address);
+    expect(screen.getByLabelText('对方完整 SHA-256 指纹')).toHaveValue(peer.fingerprint);
+    expect(screen.getByLabelText(verificationLabel)).not.toBeChecked();
+    expect(screen.getByRole('button', { name: '请求配对' })).toBeDisabled();
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
+    expect(bridge.connectPeer).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByLabelText(verificationLabel));
+    await go(`连接 ${discoveredDevice.name} (10.0.0.8:${peer.port})`);
+    expect(screen.getByLabelText('对方 IPv4 地址')).toHaveValue('10.0.0.8');
+    expect(screen.getByLabelText(verificationLabel)).not.toBeChecked();
+    await userEvent.click(screen.getByLabelText(verificationLabel));
+    await go('请求配对');
+    expect(bridge.connectPeer).toHaveBeenCalledWith('10.0.0.8', peer.port, peer.fingerprint);
+    expect(screen.getByRole('button', { name: connectionName })).toBeDisabled();
+    await act(async () => pairing.resolve(peer));
+    expect(screen.getByRole('button', { name: connectionName })).toBeEnabled();
+  });
+
+  it('displays device names as text and does not refresh a pending pairing form from advertisements', async () => {
+    vi.useFakeTimers();
+    advertise();
+    await renderNative(emptyTransfers);
+    fireEvent.click(screen.getByRole('button', { name: connectionName }));
+    fireEvent.click(screen.getByLabelText(verificationLabel));
+    vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue({
+      ...emptyDiscovery,
+      devices: [
+        { ...discoveredDevice, name: '<img src=x onerror=alert(1)>', fingerprint: 'CC'.repeat(32) },
+      ],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeInTheDocument();
+    expect(screen.getByLabelText('对方完整 SHA-256 指纹')).toHaveValue(peer.fingerprint);
+    expect(screen.getByLabelText(verificationLabel)).toBeChecked();
+    expect(document.querySelector('.discovered-list img')).toBeNull();
+  });
+
+  it('requests a real refresh once and follows the backend scanning and empty states', async () => {
+    vi.useFakeTimers();
+    await renderNative(emptyTransfers);
+    const pending = deferred<DiscoverySnapshot>();
+    vi.mocked(bridge.discoverDevices).mockReturnValue(pending.promise);
+    fireEvent.click(screen.getByRole('button', { name: '发现本地设备' }));
+    expect(screen.getByRole('button', { name: '正在发现设备…' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '正在发现设备…' }));
+    expect(bridge.discoverDevices).toHaveBeenCalledOnce();
+    await act(async () => pending.resolve({ ...emptyDiscovery, scanning: true }));
+    expect(screen.getByRole('button', { name: '正在发现设备…' })).toBeDisabled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByRole('button', { name: '发现本地设备' })).toBeEnabled();
+    expect(screen.getByText('暂未发现附近设备')).toBeInTheDocument();
+  });
+
+  it('shows discovery failures and allows retry without disabling manual pairing', async () => {
+    vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue({
+      ...emptyDiscovery,
+      state: 'error',
+      error: 'mDNS 不可用',
+    });
+    vi.mocked(bridge.discoverDevices).mockRejectedValueOnce('组播端口不可用');
+    await renderNative(emptyTransfers);
+    expect(screen.getByRole('alert')).toHaveTextContent('mDNS 不可用');
+    await go('发现本地设备');
+    expect(screen.getByRole('alert')).toHaveTextContent('组播端口不可用');
+    expect(screen.getByRole('button', { name: '发现本地设备' })).toBeEnabled();
+    await fillConnection();
+    await userEvent.click(screen.getByLabelText(verificationLabel));
+    expect(screen.getByRole('button', { name: '请求配对' })).toBeEnabled();
+    vi.mocked(bridge.discoverDevices).mockResolvedValue({ ...emptyDiscovery, scanning: true });
+    await go('发现本地设备');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('disables discovery when the listener is not running', async () => {
+    vi.mocked(bridge.getSnapshot).mockResolvedValue({
+      ...snapshot,
+      service: { ...snapshot.service, state: 'error', error: '端口占用' },
+    });
+    await renderNative();
+    expect(screen.getByRole('button', { name: '发现本地设备' })).toBeDisabled();
+    expect(screen.getByText('请先启动本机服务')).toBeInTheDocument();
+  });
+
+  it('removes expired advertisements without deleting saved trust', async () => {
+    vi.useFakeTimers();
+    advertise();
+    await renderNative();
+    expect(screen.getByRole('button', { name: connectionName })).toBeInTheDocument();
+    vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue(emptyDiscovery);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.queryByRole('button', { name: connectionName })).not.toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: `选择接收设备 ${peer.name}` })).toBeInTheDocument();
+    expect(bridge.forgetPeer).not.toHaveBeenCalled();
+  });
+
+  it('polls serially, marks stale results and recovers, then discards late replies on unmount', async () => {
+    vi.useFakeTimers();
+    advertise();
+    const view = await renderNative();
+    vi.mocked(bridge.getDiscoverySnapshot).mockRejectedValue('发现连接中断');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent('发现连接中断');
+    expect(screen.getByRole('button', { name: connectionName })).toBeDisabled();
+    const pending = deferred<DiscoverySnapshot>();
+    vi.mocked(bridge.getDiscoverySnapshot).mockReturnValueOnce(pending.promise);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    const count = vi.mocked(bridge.getDiscoverySnapshot).mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(bridge.getDiscoverySnapshot).toHaveBeenCalledTimes(count);
+    await act(async () => pending.resolve({ ...emptyDiscovery, devices: [discoveredDevice] }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: connectionName })).toBeEnabled();
+    const late = deferred<DiscoverySnapshot>();
+    vi.mocked(bridge.getDiscoverySnapshot).mockReturnValueOnce(late.promise);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    view.unmount();
+    await act(async () => late.resolve(emptyDiscovery));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('allows retry if polling fails during an active discovery window', async () => {
+    vi.useFakeTimers();
+    vi.mocked(bridge.getDiscoverySnapshot).mockResolvedValue({ ...emptyDiscovery, scanning: true });
+    await renderNative();
+    expect(screen.getByRole('button', { name: '正在发现设备…' })).toBeDisabled();
+    vi.mocked(bridge.getDiscoverySnapshot).mockRejectedValue('发现服务断开');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByRole('button', { name: '发现本地设备' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: '发现本地设备' }));
+    await act(async () => {});
+    expect(bridge.discoverDevices).toHaveBeenCalledOnce();
+  });
+
+  it('does not let an older poll overwrite a newer manual refresh', async () => {
+    vi.useFakeTimers();
+    await renderNative();
+    const old = deferred<DiscoverySnapshot>();
+    vi.mocked(bridge.getDiscoverySnapshot).mockReturnValueOnce(old.promise);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    vi.mocked(bridge.discoverDevices).mockResolvedValue({
+      ...emptyDiscovery,
+      scanning: true,
+      devices: [discoveredDevice],
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发现本地设备' }));
+    await act(async () => {});
+    await act(async () => old.resolve(emptyDiscovery));
+    expect(screen.getByRole('button', { name: connectionName })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '正在发现设备…' })).toBeDisabled();
   });
 });
 

@@ -83,8 +83,12 @@ export function ManualConnection({
   enabled,
   onError,
   onConnected,
+  discoveredPeer,
+  onConnecting,
 }: ActionProps & {
   onConnected: (peer: PeerInfo) => void;
+  discoveredPeer: PeerInfo | null;
+  onConnecting: (connecting: boolean) => void;
 }) {
   const [address, setAddress] = useState('');
   const [port, setPort] = useState('53318');
@@ -97,11 +101,22 @@ export function ManualConnection({
   const validPrint = validFingerprint(fingerprint);
   const allowed = enabled && validAddress && validPort && validPrint && verified && !connecting;
 
+  useEffect(() => {
+    if (!discoveredPeer || busy.current) return;
+    setAddress(discoveredPeer.address);
+    setPort(String(discoveredPeer.port));
+    setFingerprint(discoveredPeer.fingerprint);
+    setVerified(false);
+    document.getElementById('peer-fingerprint')?.focus({ preventScroll: true });
+    document.getElementById('manual-title')?.scrollIntoView?.({ block: 'start' });
+  }, [discoveredPeer]);
+
   async function connect(event: FormEvent) {
     event.preventDefault();
     if (!allowed || busy.current) return;
     busy.current = true;
     setConnecting(true);
+    onConnecting(true);
     onError(null);
     try {
       const peer = await bridge.connectPeer(address.trim(), Number(port), fingerprint.trim());
@@ -112,6 +127,7 @@ export function ManualConnection({
     } finally {
       busy.current = false;
       setConnecting(false);
+      onConnecting(false);
     }
   }
 
@@ -124,6 +140,12 @@ export function ManualConnection({
       <p className="section-description">
         从对方的「设备与安全」复制完整 SHA-256 指纹，并通过可信渠道核对。不要使用短码。
       </p>
+      {discoveredPeer && (
+        <p className="inline-info external-text">
+          已从附近设备「{discoveredPeer.name}
+          」填入连接信息。广播中的名称和指纹尚未验证，必须与对方屏幕逐字核对，勾选确认后才能请求配对。
+        </p>
+      )}
       <form onSubmit={connect} noValidate>
         <fieldset disabled={!enabled || connecting}>
           <div className="connection-fields">
@@ -322,7 +344,9 @@ export function TrustedPeers({
       </div>
       <p className="section-description">已配对不代表当前在线；连接状态以实际请求结果为准。</p>
       {peers.length === 0 ? (
-        <p className="diagnostic-empty">暂无可信设备，请先手动配对。这里没有模拟设备。</p>
+        <p className="diagnostic-empty">
+          暂无可信设备，请从附近设备或手动连接完成配对。这里没有模拟设备。
+        </p>
       ) : (
         <ul className="trusted-list">
           {peers.map((peer) => (

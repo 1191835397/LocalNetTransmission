@@ -4,6 +4,7 @@ import type {
   AppSettings,
   AppSnapshot,
   Diagnostic,
+  DiscoverySnapshot,
   NativeFile,
   PeerInfo,
   TransferSnapshot,
@@ -15,6 +16,8 @@ export const saveSettings = (settings: AppSettings) =>
   invoke<AppSnapshot>('save_settings', { settings });
 export const inspectFiles = (paths: string[]) => invoke<NativeFile[]>('inspect_files', { paths });
 export const runDiagnostics = () => invoke<Diagnostic[]>('run_diagnostics');
+export const getDiscoverySnapshot = () => invoke<DiscoverySnapshot>('get_discovery_snapshot');
+export const discoverDevices = () => invoke<DiscoverySnapshot>('discover_devices');
 
 export const getTransferSnapshot = () => invoke<TransferSnapshot>('get_transfer_snapshot');
 export const connectPeer = (address: string, port: number, fingerprint: string) =>

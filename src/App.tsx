@@ -22,10 +22,10 @@ import {
   Settings2,
   ShieldCheck,
   Upload,
-  Wifi,
   X,
 } from 'lucide-react';
 import * as bridge from './bridge';
+import { NearbyDevices, useDiscovery } from './DiscoveryUI';
 import { errorMessage, formatBytes, mergeFiles, validateSettings } from './utils';
 import {
   IncomingPrompt,
@@ -36,7 +36,15 @@ import {
   TrustedPeers,
   useTransferSnapshot,
 } from './TransferUI';
-import type { AppSettings, AppSnapshot, Diagnostic, NativeFile, Page, SelectedFile } from './types';
+import type {
+  AppSettings,
+  AppSnapshot,
+  Diagnostic,
+  NativeFile,
+  Page,
+  PeerInfo,
+  SelectedFile,
+} from './types';
 
 const navigation = [
   { id: 'send' as const, label: '发送文件', icon: Upload },
@@ -72,6 +80,9 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [diagnosing, setDiagnosing] = useState(false);
   const transfers = useTransferSnapshot(desktop && snapshot !== null);
+  const discovery = useDiscovery(desktop && snapshot !== null);
+  const [discoveredPeer, setDiscoveredPeer] = useState<PeerInfo | null>(null);
+  const [pairing, setPairing] = useState(false);
   const [recipient, setRecipient] = useState('');
   const [sending, setSending] = useState(false);
   const sendLock = useRef(false);
@@ -405,8 +416,8 @@ export default function App() {
             <Info size={17} />
             <span>
               <strong>{desktop ? 'P2 内部预览' : '你正在查看浏览器预览'}</strong> ·
-              桌面版支持核对完整指纹后手动配对、确认接收与单文件互传。Mac
-              与双机验证尚未完成；自动发现将在 P3 实现。
+              桌面版支持自动发现邻传设备、核对完整指纹后配对、确认接收与单文件互传。Mac
+              与双机验证尚未完成。
               {!desktop && ' 浏览器不能传输文件，也不会调用原生服务或模拟设备与结果。'}
             </span>
           </div>
@@ -615,23 +626,13 @@ export default function App() {
                   enabled={transferEnabled && !sending}
                   onError={setError}
                 />
-                <section className="card devices-card" aria-labelledby="devices-title">
-                  <div className="section-title">
-                    <h2 id="devices-title">附近设备</h2>
-                    <span className="muted-tag">P3 开放</span>
-                  </div>
-                  <div className="empty-devices">
-                    <div className="radar" aria-hidden="true">
-                      <Wifi size={25} />
-                    </div>
-                    <h3>自动发现尚未启用</h3>
-                    <p>
-                      目前不会扫描你的局域网，
-                      <br />
-                      请使用下方的手动连接表单。
-                    </p>
-                  </div>
-                </section>
+                <NearbyDevices
+                  desktop={desktop}
+                  serviceRunning={serviceRunning}
+                  pairingEnabled={transferEnabled && !pairing}
+                  discovery={discovery}
+                  onConnect={setDiscoveredPeer}
+                />
                 <section className="card this-device" aria-labelledby="this-device-title">
                   <div className="section-title">
                     <h2 id="this-device-title">这台设备</h2>
@@ -663,6 +664,8 @@ export default function App() {
             <ManualConnection
               enabled={transferEnabled}
               onError={setError}
+              discoveredPeer={discoveredPeer}
+              onConnecting={setPairing}
               onConnected={(peer) => {
                 setRecipient(peer.fingerprint);
                 setNotice('对方已批准配对，可信列表将随状态更新。');

@@ -51,6 +51,21 @@ export interface PairRequestInfo extends PeerInfo {
   expiresAt: string;
 }
 
+export interface DiscoveredDevice {
+  fingerprint: string;
+  name: string;
+  platform: string;
+  addresses: string[];
+  port: number;
+}
+
+export interface DiscoverySnapshot {
+  state: 'running' | 'error';
+  scanning: boolean;
+  devices: DiscoveredDevice[];
+  error: string | null;
+}
+
 export interface TransferInfo {
   id: string;
   direction: 'send' | 'receive';
